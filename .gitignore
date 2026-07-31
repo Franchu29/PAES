@@ -1,0 +1,12 @@
+node_modules/
+.env
+dist/
+build/
+uploads/
+vector_db.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env/
