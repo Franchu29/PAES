@@ -1,0 +1,3 @@
+{
+  "ignore": ["**/vector_db.json"]
+}
