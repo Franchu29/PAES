@@ -8,7 +8,7 @@ const OLLAMA_URL = "http://localhost:11434/api/embeddings";
 const EMBED_MODEL = "nomic-embed-text";
 const DEDUP_THRESHOLD = 0.95;
 const ABSOLUTE_MIN_SCORE = 0.5; // debajo de esto, no hay contexto relevante real
-const TOP_K = 5;
+const TOP_K = 3;
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
@@ -79,13 +79,35 @@ const cosineSimilarity = (a, b) => {
 };
 
 /**
- * chunks ahora es un array de OBJETOS, no de strings:
- *   { text: string, pageNum: number }
+ * Normaliza pageNum/pages sin importar qué shape traiga el chunk de
+ * origen. Contempla 3 casos:
+ *   - chunk del chunking nuevo (splitByPregunta): { pageNum, pages: [1,2] }
+ *   - chunk del fallback viejo (splitSmart por página): { pageNum }
+ *   - string plano (compat retro, sin metadata de página)
+ */
+const normalizePageInfo = (rawChunk) => {
+  if (typeof rawChunk === "string") {
+    return { pageNum: null, pages: [] };
+  }
+  const pageNum = rawChunk.pageNum ?? null;
+  const pages = Array.isArray(rawChunk.pages)
+    ? rawChunk.pages.filter((p) => p !== null && p !== undefined)
+    : pageNum !== null
+    ? [pageNum]
+    : [];
+  return { pageNum, pages };
+};
+
+/**
+ * chunks es un array de OBJETOS: { text, pageNum, pages?, preguntaNum?,
+ * sectionTitle? } (pages, preguntaNum y sectionTitle son opcionales —
+ * preguntaNum viene del chunking por "Pregunta N", sectionTitle viene
+ * del chunking por secciones/heading; nunca coexisten en el mismo chunk
+ * porque provienen de ramas distintas de la cascada de chunking).
  * docId identifica el documento de origen (ej. nombre del PDF).
- * Guardar pageNum/docId es lo que permite citar la fuente al alumno
- * y, más adelante, activar revisión visual solo en páginas con tablas.
- * Se mantiene compatibilidad: si pasas un array de strings, sigue
- * funcionando pero sin pageNum (null).
+ * Guardar pages/docId/preguntaNum/sectionTitle es lo que permite citar
+ * la fuente al alumno con precisión, incluso cuando la respuesta está
+ * repartida en más de una página del PDF original.
  */
 export const addChunksToVectorDB = async (chunks, docId = "unknown") => {
   console.log("📥 Procesando", chunks.length, "chunks de", docId);
@@ -98,8 +120,11 @@ export const addChunksToVectorDB = async (chunks, docId = "unknown") => {
 
       const rawChunk = chunks[i];
       const rawText = typeof rawChunk === "string" ? rawChunk : rawChunk.text;
-      const pageNum =
-        typeof rawChunk === "string" ? null : rawChunk.pageNum ?? null;
+      const { pageNum, pages } = normalizePageInfo(rawChunk);
+      const preguntaNum =
+        typeof rawChunk === "string" ? null : rawChunk.preguntaNum ?? null;
+      const sectionTitle =
+        typeof rawChunk === "string" ? null : rawChunk.sectionTitle ?? null;
       const text = rawText.trim();
 
       // 1. detectar truncados
@@ -148,7 +173,10 @@ export const addChunksToVectorDB = async (chunks, docId = "unknown") => {
       db.push({
         text: cleanText,
         embedding,
-        pageNum,
+        pageNum,        // compat: primera página del chunk (o null)
+        pages,          // array completo de páginas que toca el chunk
+        preguntaNum,    // "1", "2", ... si viene del chunking por "Pregunta N"
+        sectionTitle,   // título de sección si viene del chunking por secciones
         docId,
         createdAt: new Date().toISOString(),
       });
@@ -164,15 +192,34 @@ export const addChunksToVectorDB = async (chunks, docId = "unknown") => {
 };
 
 /**
- * CAMBIO DE CONTRATO respecto a la versión anterior:
- * Antes devolvía un string siempre. Ahora devuelve:
+ * Formatea la etiqueta de fuente para el contexto inyectado al prompt.
+ * Prioriza preguntaNum sobre sectionTitle porque son mutuamente
+ * excluyentes (vienen de ramas distintas de la cascada de chunking) —
+ * si algún día coexistieran, preguntaNum es la señal más específica.
+ */
+const formatPageLabel = (item) => {
+  const pageLabel =
+    item.pages && item.pages.length > 1
+      ? `Págs. ${item.pages.join("-")}`
+      : item.pages && item.pages.length === 1
+      ? `Pág. ${item.pages[0]}`
+      : `Pág. ${item.pageNum ?? "?"}`;
+
+  if (item.preguntaNum) return `${pageLabel} — Pregunta ${item.preguntaNum}`;
+  if (item.sectionTitle) return `${pageLabel} — ${item.sectionTitle}`;
+  return pageLabel;
+};
+
+/**
+ * Devuelve:
  *   - null                        → no hay contexto suficientemente relevante
  *   - { context, sources }        → context listo para el prompt (con
- *                                    citas de página), sources es la lista
- *                                    de {pageNum, docId, score} usada
+ *                                    citas de página/sección), sources es
+ *                                    la lista de {pageNum, pages, docId,
+ *                                    preguntaNum, sectionTitle, score}
  *
- * Hay que actualizar el código que llama a queryVectorDB para manejar
- * el caso null (responder "no tengo ese contenido" en vez de alucinar).
+ * El código que llama a queryVectorDB debe manejar el caso null
+ * (responder "no tengo ese contenido" en vez de alucinar).
  */
 export const queryVectorDB = async (query) => {
   console.log("🔎 Buscando...");
@@ -184,6 +231,9 @@ export const queryVectorDB = async (query) => {
   const scored = db.map((item) => ({
     text: item.text,
     pageNum: item.pageNum,
+    pages: item.pages || [],
+    preguntaNum: item.preguntaNum ?? null,
+    sectionTitle: item.sectionTitle ?? null,
     docId: item.docId,
     score: cosineSimilarity(queryEmbedding, item.embedding),
   }));
@@ -211,15 +261,23 @@ export const queryVectorDB = async (query) => {
 
   console.log(
     "📌 Resultados usados:",
-    results.map((r) => ({ pageNum: r.pageNum, score: r.score.toFixed(3) }))
+    results.map((r) => ({
+      pageNum: r.pageNum,
+      preguntaNum: r.preguntaNum,
+      sectionTitle: r.sectionTitle,
+      score: r.score.toFixed(3),
+    }))
   );
 
   const context = results
-    .map((r) => `[Pág. ${r.pageNum ?? "?"}] ${r.text.trim()}`)
+    .map((r) => `[${formatPageLabel(r)}] ${r.text.trim()}`)
     .join("\n\n---\n\n");
 
   const sources = results.map((r) => ({
     pageNum: r.pageNum,
+    pages: r.pages,
+    preguntaNum: r.preguntaNum,
+    sectionTitle: r.sectionTitle,
     docId: r.docId,
     score: r.score,
   }));
